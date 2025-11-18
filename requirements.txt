@@ -1,3 +1,2 @@
 python-telegram-bot[job-queue]==21.0.1
-Flask
-gunicorn
+aiohttp
