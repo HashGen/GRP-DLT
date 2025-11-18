@@ -6,7 +6,10 @@ import asyncio
 from flask import Flask
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+# =========================================================================
+# CRITICAL IMPORT: JobQueue ko alag se import karna hai
+# =========================================================================
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue
 from telegram.error import BadRequest
 
 # --- Flask App Setup ---
@@ -100,9 +103,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     if not state.get('is_running', False): return
     if update.message and update.message.from_user.id == context.bot.id: return
-    message = update.message
-    delay = state.get('delay_seconds', 30)
-    context.job_queue.run_once(repost_and_delete, delay, data={'chat_id': message.chat_id, 'message_id': message.message_id}, name=str(message.message_id))
+    # IMPORTANT: Access job_queue via context.application.job_queue
+    context.application.job_queue.run_once(
+        repost_and_delete,
+        state.get('delay_seconds', 30),
+        data={'chat_id': update.message.chat_id, 'message_id': update.message.message_id},
+        name=str(update.message.message_id)
+    )
 
 async def repost_and_delete(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
@@ -115,7 +122,6 @@ async def repost_and_delete(context: ContextTypes.DEFAULT_TYPE):
 
 # --- Main Bot Function to run in a thread ---
 def run_bot():
-    # Fix for threading issue
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
@@ -124,9 +130,15 @@ def run_bot():
         logger.critical("CRITICAL ERROR: Bot Token not found!")
         return
         
-    application = Application.builder().token(TOKEN).build()
-    
-    # Add all handlers
+    # =========================================================================
+    # FINAL CRITICAL FIX: Manually create JobQueue and pass it to the builder
+    # =========================================================================
+    job_queue = JobQueue()
+    application = (
+        Application.builder().token(TOKEN).job_queue(job_queue).build()
+    )
+    # =========================================================================
+
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("setdelay", setdelay_command))
@@ -136,14 +148,7 @@ def run_bot():
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
     logger.info("Starting bot polling...")
-    
-    # =========================================================================
-    # FINAL CRITICAL FIX: Disable signal handling in the polling thread
-    # =========================================================================
     application.run_polling(stop_signals=None)
-    # =========================================================================
-    
-    logger.info("Bot polling has stopped.")
 
 # --- Main Execution Block ---
 bot_thread = threading.Thread(target=run_bot)
