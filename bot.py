@@ -6,10 +6,7 @@ import asyncio
 from flask import Flask
 
 from telegram import Update
-# =========================================================================
-# CRITICAL IMPORT: JobQueue ko alag se import karna hai
-# =========================================================================
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import BadRequest
 
 # --- Flask App Setup ---
@@ -103,13 +100,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     if not state.get('is_running', False): return
     if update.message and update.message.from_user.id == context.bot.id: return
-    # IMPORTANT: Access job_queue via context.application.job_queue
-    context.application.job_queue.run_once(
+    
+    # =========================================================================
+    # FINAL CRITICAL FIX #2: Access job_queue this way
+    # =========================================================================
+    job_queue = context.application.job_queue
+    job_queue.run_once(
         repost_and_delete,
         state.get('delay_seconds', 30),
         data={'chat_id': update.message.chat_id, 'message_id': update.message.message_id},
         name=str(update.message.message_id)
     )
+    # =========================================================================
 
 async def repost_and_delete(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
@@ -129,15 +131,9 @@ def run_bot():
     if not TOKEN:
         logger.critical("CRITICAL ERROR: Bot Token not found!")
         return
-        
-    # =========================================================================
-    # FINAL CRITICAL FIX: Manually create JobQueue and pass it to the builder
-    # =========================================================================
-    job_queue = JobQueue()
-    application = (
-        Application.builder().token(TOKEN).job_queue(job_queue).build()
-    )
-    # =========================================================================
+    
+    # Let the builder create its own JobQueue
+    application = Application.builder().token(TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
