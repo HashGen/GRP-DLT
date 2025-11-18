@@ -28,7 +28,7 @@ if MONGO_URI:
         db = mongo_client.get_database("telegram_bot_db")
         config_collection = db.config
         loops_collection = db.active_loops
-        loops_collection.create_index("current_message_id") # For faster lookups
+        loops_collection.create_index("current_message_id")
         logger.info("Successfully connected to MongoDB.")
     except Exception as e:
         logger.error(f"Could not connect to MongoDB: {e}")
@@ -64,7 +64,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = "Hello! This is the bulletproof Scrubber Bot.\n\n" \
                 "**How it works:**\n" \
                 "1. Set a loop duration ONCE with `/setloopduration`.\n" \
-                "2. Any file you send will loop for that duration.\n" \
+                "2. Any file a HUMAN sends will loop for that duration.\n" \
                 "3. After the time is up, the file is deleted permanently.\n\n" \
                 "**Admin Commands:**\n" \
                 "`/setloopduration <time>`\n" \
@@ -116,79 +116,64 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(status_msg, parse_mode='Markdown')
 
 # --- New, Bulletproof Message Processing Logic ---
-async def process_and_loop(context: ContextTypes.DEFAULT_TYPE, loop_doc: dict):
-    """A self-contained function to process one cycle of a loop."""
-    config = get_config()
-    delay = config.get('repost_delay_seconds')
-    
-    await asyncio.sleep(delay)
-    
-    # Re-fetch the document to ensure it hasn't been stopped
-    current_loop_doc = loops_collection.find_one({"_id": loop_doc["_id"]})
-    if not current_loop_doc:
-        logger.info(f"Loop {loop_doc['_id']} was stopped manually. Halting.")
-        return
+async def loop_processor(context: ContextTypes.DEFAULT_TYPE, loop_id: ObjectId):
+    """A dedicated, self-sustaining loop for a single file."""
+    while True:
+        config = get_config()
+        repost_delay = config.get('repost_delay_seconds')
+        
+        await asyncio.sleep(repost_delay)
+        
+        loop_doc = loops_collection.find_one({"_id": loop_id})
 
-    chat_id = current_loop_doc.get("current_chat_id")
-    message_id = current_loop_doc.get("current_message_id")
+        if not loop_doc:
+            logger.info(f"Loop {loop_id} stopped (manually or deleted).")
+            break
 
-    try:
-        new_message = await context.bot.copy_message(chat_id=chat_id, from_chat_id=chat_id, message_id=message_id)
-        # IMPORTANT: Update the DB with the new message ID *before* deleting the old one
-        loops_collection.update_one(
-            {"_id": current_loop_doc["_id"]},
-            {"$set": {"current_message_id": new_message.message_id}}
-        )
-    except Exception as e:
-        logger.error(f"Failed to repost message for loop {current_loop_doc['_id']}: {e}. Stopping loop.")
-        loops_collection.delete_one({"_id": current_loop_doc["_id"]})
-    finally:
-        # Always delete the old message
+        # Convert stored string back to datetime object for comparison
+        expiration_time = loop_doc.get("expiration_time")
+        if expiration_time < datetime.now():
+            logger.info(f"Loop {loop_id} expired. Performing final delete.")
+            try:
+                await context.bot.delete_message(chat_id=loop_doc.get("current_chat_id"), message_id=loop_doc.get("current_message_id"))
+            except BadRequest: pass
+            loops_collection.delete_one({"_id": loop_id})
+            break
+
+        chat_id = loop_doc.get("current_chat_id")
+        message_id = loop_doc.get("current_message_id")
+
         try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except BadRequest:
-            pass
+            new_message = await context.bot.copy_message(chat_id=chat_id, from_chat_id=chat_id, message_id=message_id)
+            loops_collection.update_one({"_id": loop_id}, {"$set": {"current_message_id": new_message.message_id}})
+        except Exception as e:
+            logger.error(f"Failed to repost for loop {loop_id}: {e}. Stopping loop.")
+            loops_collection.delete_one({"_id": loop_id})
+            break
+        finally:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except BadRequest: pass
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """This function now handles BOTH new and reposted messages."""
+    """Handles only NEW messages from HUMAN users to start a loop."""
     if not update.message or loops_collection is None: return
     
-    config = get_config()
-    chat_id = update.message.chat_id
-    message_id = update.message.message_id
-    loop_doc = None
-    
-    is_from_bot = update.message.from_user.id == context.bot.id
-
-    if is_from_bot:
-        # It's a reposted message. Find its loop in the DB.
-        loop_doc = loops_collection.find_one({"current_message_id": message_id})
-        if not loop_doc:
-            # This is a stray bot message (like a command reply), ignore it.
-            return
-    else:
-        # It's a new message from a human. Start a new loop.
-        expiration_time = datetime.now() + timedelta(seconds=config.get('loop_duration_seconds'))
-        new_loop = {
-            "current_chat_id": chat_id,
-            "current_message_id": message_id,
-            "expiration_time": expiration_time
-        }
-        result = loops_collection.insert_one(new_loop)
-        loop_doc = loops_collection.find_one({"_id": result.inserted_id})
-
-    # Now, check the timer for this loop
-    if loop_doc and loop_doc.get("expiration_time") < datetime.now():
-        logger.info(f"Loop {loop_doc.get('_id')} expired. Performing final delete.")
-        try:
-            await context.bot.delete_message(chat_id=loop_doc.get("current_chat_id"), message_id=loop_doc.get("current_message_id"))
-        except BadRequest: pass
-        # Clean up the database
-        loops_collection.delete_one({"_id": loop_doc.get("_id")})
+    if update.message.from_user.is_bot:
         return
 
-    # If we are here, the loop is active. Schedule the next cycle.
-    asyncio.create_task(process_and_loop(context, loop_doc))
+    config = get_config()
+    expiration_time = datetime.now() + timedelta(seconds=config.get('loop_duration_seconds'))
+    
+    new_loop = {
+        "current_chat_id": update.message.chat_id,
+        "current_message_id": update.message.message_id,
+        "expiration_time": expiration_time
+    }
+    result = loops_collection.insert_one(new_loop)
+    
+    logger.info(f"Starting a new loop: {result.inserted_id}")
+    asyncio.create_task(loop_processor(context, result.inserted_id))
 
 # --- Web Server and Main Bot Execution ---
 async def web_server():
@@ -203,20 +188,25 @@ async def main():
     if not TOKEN: logger.critical("CRITICAL ERROR: Bot Token not found!"); return
     application = Application.builder().token(TOKEN).build()
     
-    # Add all handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("setloopduration", setloopduration_command))
     application.add_handler(CommandHandler("setdelay", setdelay_command))
     application.add_handler(CommandHandler("stopallloops", stopallloops_command))
     application.add_handler(CommandHandler("status", status_command))
-    # This single handler now manages the entire loop logic
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
     
-    # Run bot and web server
     async with application:
         await application.start()
         await application.updater.start_polling()
+
+        # On startup, restart any loops that were active
+        if loops_collection is not None:
+            logger.info("Restarting any pending loops from the database...")
+            for loop in list(loops_collection.find({})):
+                logger.info(f"Re-activating loop: {loop['_id']}")
+                asyncio.create_task(loop_processor(application, loop['_id']))
+
         web_task = asyncio.create_task(web_server())
         await web_task
         await application.updater.stop()
