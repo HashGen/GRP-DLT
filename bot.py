@@ -1,19 +1,12 @@
 import logging
 import json
 import os
-import threading
 import asyncio
-from flask import Flask
+from aiohttp import web
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import BadRequest
-
-# --- Flask App Setup ---
-app = Flask(__name__)
-@app.route('/')
-def index():
-    return "Bot is running and live!"
 
 # --- Basic Bot Setup ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -41,7 +34,7 @@ def save_state(state):
 
 # --- Admin Check, Command Handlers, Message Handlers ---
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if update.message.chat.type == 'private': return True
+    if not update.message or update.message.chat.type == 'private': return True
     chat_id = update.message.chat.id
     user_id = update.message.from_user.id
     if 'admins' not in context.chat_data:
@@ -50,9 +43,7 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return user_id in context.chat_data.get('admins', [])
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        await update.message.reply_text("⛔ Sorry, this command can only be used by admins.")
-        return
+    if not await is_admin(update, context): return
     help_text = "Hello! I am a Content Scrubber Bot.\n\n" \
                 "**Admin Commands:**\n" \
                 "`/setdelay <seconds>`\n" \
@@ -71,7 +62,7 @@ async def setdelay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state = load_state()
         state['delay_seconds'] = delay
         save_state(state)
-        await update.message.reply_text(f"✅ Delay time has been set to **{delay} seconds**.", parse_mode='Markdown')
+        await update.message.reply_text(f"✅ Delay time set to **{delay} seconds**.", parse_mode='Markdown')
     except (IndexError, ValueError):
         await update.message.reply_text("Incorrect format! Use: `/setdelay 30`")
 
@@ -80,14 +71,14 @@ async def startscrub_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     state = load_state()
     state['is_running'] = True
     save_state(state)
-    await update.message.reply_text("🚀 **Scrubber process has been started!**", parse_mode='Markdown')
+    await update.message.reply_text("🚀 **Scrubber process started!**", parse_mode='Markdown')
 
 async def stopscrub_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context): return
     state = load_state()
     state['is_running'] = False
     save_state(state)
-    await update.message.reply_text("🛑 **Scrubber process has been stopped.**", parse_mode='Markdown')
+    await update.message.reply_text("🛑 **Scrubber process stopped.**", parse_mode='Markdown')
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context): return
@@ -101,7 +92,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not state.get('is_running', False): return
     if update.message and update.message.from_user.id == context.bot.id: return
     
-    # Access job_queue this way
     context.application.job_queue.run_once(
         repost_and_delete,
         state.get('delay_seconds', 30),
@@ -118,17 +108,27 @@ async def repost_and_delete(context: ContextTypes.DEFAULT_TYPE):
     except BadRequest as e:
         logger.warning(f"Could not process message {message_id}: {e}")
 
-# --- Main Bot Function to run in a thread ---
-def run_bot():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
+# --- Web Server to keep Render alive ---
+async def web_server():
+    app = web.Application()
+    async def hello(request):
+        return web.Response(text="Bot is running!")
+    app.add_routes([web.get('/', hello)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get('PORT', 8080)))
+    logger.info("Starting web server...")
+    await site.start()
+    # Keep the server running in the background
+    while True:
+        await asyncio.sleep(3600)
+
+async def main():
     TOKEN = os.environ.get("TOKEN")
     if not TOKEN:
         logger.critical("CRITICAL ERROR: Bot Token not found!")
         return
-    
-    # Let the builder create its own JobQueue
+
     application = Application.builder().token(TOKEN).build()
 
     # Add handlers
@@ -139,11 +139,22 @@ def run_bot():
     application.add_handler(CommandHandler("stopscrub", stopscrub_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+    
+    # Run bot and web server concurrently
+    async with application:
+        logger.info("Starting bot polling...")
+        await application.start()
+        await application.updater.start_polling()
+        
+        # Start the web server
+        web_task = asyncio.create_task(web_server())
+        
+        # Keep everything running
+        await web_task
+        
+        # Stop the bot when the web server stops (won't happen in this case)
+        await application.updater.stop()
+        await application.stop()
 
-    logger.info("Starting bot polling...")
-    application.run_polling(stop_signals=None)
-
-# --- Main Execution Block ---
-bot_thread = threading.Thread(target=run_bot)
-bot_thread.daemon = True
-bot_thread.start()
+if __name__ == "__main__":
+    asyncio.run(main())
