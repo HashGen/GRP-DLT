@@ -24,7 +24,7 @@ loops_collection = None
 if MONGO_URI:
     try:
         mongo_client = pymongo.MongoClient(MONGO_URI)
-        db = mongo_client.get_database("telegram_bot_db") # You can name your DB anything
+        db = mongo_client.get_database("telegram_bot_db")
         config_collection = db.config
         loops_collection = db.active_loops
         logger.info("Successfully connected to MongoDB.")
@@ -33,17 +33,22 @@ if MONGO_URI:
 else:
     logger.warning("MONGO_URI not found. Bot will not have permanent memory.")
 
-# --- State Management using MongoDB ---
+# --- State Management using MongoDB (Corrected) ---
 def get_config():
-    default_config = {"_id": "main_config", "repost_delay_seconds": 30, "loop_duration_seconds": 43200} # Default 12 hours
-    if config_collection:
+    default_config = {"_id": "main_config", "repost_delay_seconds": 30, "loop_duration_seconds": 43200}
+    # CORRECTED CHECK:
+    if config_collection is not None:
         config = config_collection.find_one({"_id": "main_config"})
         if config:
+            # Ensure all keys are present
+            for key, value in default_config.items():
+                config.setdefault(key, value)
             return config
     return default_config
 
 def save_config(config):
-    if config_collection:
+    # CORRECTED CHECK:
+    if config_collection is not None:
         config_collection.update_one({"_id": "main_config"}, {"$set": config}, upsert=True)
 
 # --- Admin Check and Handlers ---
@@ -108,9 +113,12 @@ async def setdelay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stopallloops_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context): return
-    if loops_collection:
-        loops_collection.delete_many({})
-    await update.message.reply_text("🛑 **All active loops have been stopped.**", parse_mode='Markdown')
+    # CORRECTED CHECK:
+    if loops_collection is not None:
+        result = loops_collection.delete_many({})
+        await update.message.reply_text(f"🛑 **All {result.deleted_count} active loops have been stopped.**", parse_mode='Markdown')
+    else:
+        await update.message.reply_text("Database not connected. Cannot stop loops.")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context): return
@@ -119,7 +127,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     duration_seconds = config.get('loop_duration_seconds')
     duration_hours = duration_seconds / 3600
     
-    active_loops_count = loops_collection.count_documents({}) if loops_collection else 0
+    # CORRECTED CHECK:
+    active_loops_count = loops_collection.count_documents({}) if loops_collection is not None else 0
     
     status_msg = (
         f"**📊 Bot Status**\n\n"
@@ -129,7 +138,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(status_msg, parse_mode='Markdown')
 
-# --- New Message Processing Logic ---
 async def process_message(context: ContextTypes.DEFAULT_TYPE, loop_doc: dict):
     config = get_config()
     delay = config.get('repost_delay_seconds')
@@ -142,9 +150,7 @@ async def process_message(context: ContextTypes.DEFAULT_TYPE, loop_doc: dict):
 
     try:
         new_message = await context.bot.copy_message(chat_id=chat_id, from_chat_id=chat_id, message_id=message_id)
-        
-        # Update MongoDB to track the new message ID
-        if loops_collection:
+        if loops_collection is not None:
             loops_collection.update_one(
                 {"_id": original_loop_id},
                 {"$set": {"current_message_id": new_message.message_id}}
@@ -152,14 +158,14 @@ async def process_message(context: ContextTypes.DEFAULT_TYPE, loop_doc: dict):
     finally:
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except BadRequest:
-            pass
+        except BadRequest: pass
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not loops_collection: return
+    # CORRECTED CHECK:
+    if not update.message or loops_collection is None: return
     
     config = get_config()
-    chat_id = update.message.chat_id
+    chat_id = update.message.chat.id
     message_id = update.message.message_id
     loop_doc = None
     
@@ -169,7 +175,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop_doc = loops_collection.find_one({"current_message_id": message_id})
         if not loop_doc: return
     else:
-        # New message from a user, create a new loop
         expiration_time = datetime.now() + timedelta(seconds=config.get('loop_duration_seconds'))
         new_loop = {
             "original_message_id": message_id,
@@ -180,7 +185,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = loops_collection.insert_one(new_loop)
         loop_doc = loops_collection.find_one({"_id": result.inserted_id})
 
-    # Check the timer for this loop
     if loop_doc and loop_doc.get("expiration_time") < datetime.now():
         logger.info(f"Loop {loop_doc.get('_id')} expired. Performing final delete.")
         try:
@@ -189,9 +193,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loops_collection.delete_one({"_id": loop_doc.get("_id")})
         return
 
-    # If the loop is active, schedule the next cycle
     asyncio.create_task(process_message(context, loop_doc))
-
 
 # --- Web Server and Main Bot Execution ---
 async def web_server():
