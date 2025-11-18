@@ -3,6 +3,8 @@ import json
 import os
 import asyncio
 from aiohttp import web
+import pymongo
+from datetime import datetime, timedelta
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -12,27 +14,39 @@ from telegram.error import BadRequest
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-STATE_FILE = 'bot_state.json'
-logger.info(f"State file path: {STATE_FILE}")
+# --- MongoDB Database Setup (Permanent Memory) ---
+MONGO_URI = os.environ.get('MONGO_URI')
+mongo_client = None
+db = None
+config_collection = None
+loops_collection = None
 
-
-# --- File-based State Management ---
-def load_state():
+if MONGO_URI:
     try:
-        with open(STATE_FILE, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        logger.warning("State file not found. Creating a default state.")
-        return {"is_running": False, "delay_seconds": 30}
-
-def save_state(state):
-    try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump(state, f, indent=4)
+        mongo_client = pymongo.MongoClient(MONGO_URI)
+        db = mongo_client.get_database("telegram_bot_db") # You can name your DB anything
+        config_collection = db.config
+        loops_collection = db.active_loops
+        logger.info("Successfully connected to MongoDB.")
     except Exception as e:
-        logger.error(f"Failed to save state file: {e}")
+        logger.error(f"Could not connect to MongoDB: {e}")
+else:
+    logger.warning("MONGO_URI not found. Bot will not have permanent memory.")
 
-# --- Admin Check, Command Handlers ---
+# --- State Management using MongoDB ---
+def get_config():
+    default_config = {"_id": "main_config", "repost_delay_seconds": 30, "loop_duration_seconds": 43200} # Default 12 hours
+    if config_collection:
+        config = config_collection.find_one({"_id": "main_config"})
+        if config:
+            return config
+    return default_config
+
+def save_config(config):
+    if config_collection:
+        config_collection.update_one({"_id": "main_config"}, {"$set": config}, upsert=True)
+
+# --- Admin Check and Handlers ---
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not update.message or update.message.chat.type == 'private': return True
     chat_id = update.message.chat.id
@@ -44,13 +58,39 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context): return
-    help_text = "Hello! I am a Content Scrubber Bot.\n\n" \
-                "**Admin Commands:**\n" \
-                "`/setdelay <seconds>`\n" \
-                "`/startscrub`\n" \
-                "`/stopscrub`\n" \
-                "`/status`"
+    help_text = (
+        "Hello! This is the final, MongoDB-powered Scrubber Bot.\n\n"
+        "**How it works:**\n"
+        "1. Set a loop duration ONCE with `/setloopduration`.\n"
+        "2. Any file you send will loop for that duration.\n"
+        "3. After the time is up, the file is deleted permanently.\n\n"
+        "**Admin Commands:**\n"
+        "`/setloopduration <time>` - Sets the loop time for ALL new files. e.g., `/setloopduration 12h` or `30m`.\n\n"
+        "`/setdelay <seconds>` - Sets the repost interval.\n\n"
+        "`/stopallloops` - Stops ALL active loops immediately.\n\n"
+        "`/status` - Checks the current settings."
+    )
     await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def setloopduration_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): return
+    if not context.args:
+        await update.message.reply_text("Please provide a duration. Example: `/setloopduration 12h`")
+        return
+    duration_str = context.args[0].lower()
+    try:
+        value = int(duration_str[:-1])
+        unit = duration_str[-1]
+        if unit == 'h': seconds = value * 3600
+        elif unit == 'm': seconds = value * 60
+        else: raise ValueError("Invalid unit")
+        
+        config = get_config()
+        config['loop_duration_seconds'] = seconds
+        save_config(config)
+        await update.message.reply_text(f"✅ Loop duration for all new files set to **{value}{unit}**.")
+    except (ValueError, IndexError):
+        await update.message.reply_text("Invalid format. Use: `/setloopduration 12h` or `/setloopduration 30m`")
 
 async def setdelay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context): return
@@ -59,101 +99,129 @@ async def setdelay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not 5 <= delay <= 300:
             await update.message.reply_text("❗Delay must be between 5 and 300 seconds.")
             return
-        state = load_state()
-        state['delay_seconds'] = delay
-        save_state(state)
-        await update.message.reply_text(f"✅ Delay time set to **{delay} seconds**.", parse_mode='Markdown')
+        config = get_config()
+        config['repost_delay_seconds'] = delay
+        save_config(config)
+        await update.message.reply_text(f"✅ Repost delay set to **{delay} seconds**.", parse_mode='Markdown')
     except (IndexError, ValueError):
         await update.message.reply_text("Incorrect format! Use: `/setdelay 30`")
 
-async def startscrub_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stopallloops_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context): return
-    state = load_state()
-    state['is_running'] = True
-    save_state(state)
-    await update.message.reply_text("🚀 **Scrubber process started!**", parse_mode='Markdown')
-
-async def stopscrub_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
-    state = load_state()
-    state['is_running'] = False
-    save_state(state)
-    await update.message.reply_text("🛑 **Scrubber process stopped.**", parse_mode='Markdown')
+    if loops_collection:
+        loops_collection.delete_many({})
+    await update.message.reply_text("🛑 **All active loops have been stopped.**", parse_mode='Markdown')
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context): return
-    state = load_state()
-    status_text = "🟢 **Running**" if state.get('is_running', False) else "🔴 **Stopped**"
-    delay_text = state.get('delay_seconds', 'N/A')
-    await update.message.reply_text(f"**📊 Bot Status**\n\n🔹 **Process:** {status_text}\n🔹 **Delay:** **{delay_text} seconds**", parse_mode='Markdown')
+    config = get_config()
+    delay = config.get('repost_delay_seconds')
+    duration_seconds = config.get('loop_duration_seconds')
+    duration_hours = duration_seconds / 3600
+    
+    active_loops_count = loops_collection.count_documents({}) if loops_collection else 0
+    
+    status_msg = (
+        f"**📊 Bot Status**\n\n"
+        f"🔹 **Repost Delay:** **{delay} seconds**\n"
+        f"🔹 **Loop Duration (for new files):** **{duration_hours:.1f} hours**\n"
+        f"🔹 **Files Currently Looping:** **{active_loops_count}**"
+    )
+    await update.message.reply_text(status_msg, parse_mode='Markdown')
 
 # --- New Message Processing Logic ---
-async def process_message_after_delay(context: ContextTypes.DEFAULT_TYPE, delay: int, chat_id: int, message_id: int):
-    """Waits for a delay, then reposts and deletes the message."""
+async def process_message(context: ContextTypes.DEFAULT_TYPE, loop_doc: dict):
+    config = get_config()
+    delay = config.get('repost_delay_seconds')
+    
     await asyncio.sleep(delay)
+    
+    chat_id = loop_doc.get("current_chat_id")
+    message_id = loop_doc.get("current_message_id")
+    original_loop_id = loop_doc.get("_id")
+
     try:
-        await context.bot.copy_message(chat_id=chat_id, from_chat_id=chat_id, message_id=message_id)
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except BadRequest as e:
-        logger.warning(f"Could not process message {message_id}: {e}")
+        new_message = await context.bot.copy_message(chat_id=chat_id, from_chat_id=chat_id, message_id=message_id)
+        
+        # Update MongoDB to track the new message ID
+        if loops_collection:
+            loops_collection.update_one(
+                {"_id": original_loop_id},
+                {"$set": {"current_message_id": new_message.message_id}}
+            )
+    finally:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except BadRequest:
+            pass
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = load_state()
-    if not state.get('is_running', False): return
-    if not update.message or update.message.from_user.id == context.bot.id: return
+    if not update.message or not loops_collection: return
     
-    # Create a new task to handle the message in the background
-    asyncio.create_task(
-        process_message_after_delay(
-            context,
-            state.get('delay_seconds', 30),
-            update.message.chat_id,
-            update.message.message_id
-        )
-    )
+    config = get_config()
+    chat_id = update.message.chat_id
+    message_id = update.message.message_id
+    loop_doc = None
+    
+    is_from_bot = update.message.from_user.id == context.bot.id
 
-# --- Web Server to keep Render alive ---
+    if is_from_bot:
+        loop_doc = loops_collection.find_one({"current_message_id": message_id})
+        if not loop_doc: return
+    else:
+        # New message from a user, create a new loop
+        expiration_time = datetime.now() + timedelta(seconds=config.get('loop_duration_seconds'))
+        new_loop = {
+            "original_message_id": message_id,
+            "current_chat_id": chat_id,
+            "current_message_id": message_id,
+            "expiration_time": expiration_time
+        }
+        result = loops_collection.insert_one(new_loop)
+        loop_doc = loops_collection.find_one({"_id": result.inserted_id})
+
+    # Check the timer for this loop
+    if loop_doc and loop_doc.get("expiration_time") < datetime.now():
+        logger.info(f"Loop {loop_doc.get('_id')} expired. Performing final delete.")
+        try:
+            await context.bot.delete_message(chat_id=loop_doc.get("current_chat_id"), message_id=loop_doc.get("current_message_id"))
+        except BadRequest: pass
+        loops_collection.delete_one({"_id": loop_doc.get("_id")})
+        return
+
+    # If the loop is active, schedule the next cycle
+    asyncio.create_task(process_message(context, loop_doc))
+
+
+# --- Web Server and Main Bot Execution ---
 async def web_server():
     app = web.Application()
-    async def hello(request):
-        return web.Response(text="Bot is running!")
+    async def hello(request): return web.Response(text="Bot is running!")
     app.add_routes([web.get('/', hello)])
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get('PORT', 8080)))
-    logger.info("Starting web server...")
     await site.start()
-    # Keep the server running in the background
-    while True:
-        await asyncio.sleep(3600)
+    while True: await asyncio.sleep(3600)
 
 async def main():
     TOKEN = os.environ.get("TOKEN")
     if not TOKEN:
         logger.critical("CRITICAL ERROR: Bot Token not found!")
         return
-
-    # IMPORTANT: We are not using the builder's job_queue
     application = Application.builder().token(TOKEN).build()
-
-    # Add handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
+    application.add_handler(CommandHandler("setloopduration", setloopduration_command))
     application.add_handler(CommandHandler("setdelay", setdelay_command))
-    application.add_handler(CommandHandler("startscrub", startscrub_command))
-    application.add_handler(CommandHandler("stopscrub", stopscrub_command))
+    application.add_handler(CommandHandler("stopallloops", stopallloops_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
-    
-    # Run bot and web server concurrently
     async with application:
-        logger.info("Starting bot polling...")
         await application.start()
         await application.updater.start_polling()
-        
         web_task = asyncio.create_task(web_server())
         await web_task
-        
         await application.updater.stop()
         await application.stop()
 
