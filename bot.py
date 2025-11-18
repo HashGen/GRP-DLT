@@ -2,9 +2,7 @@ import logging
 import json
 import os
 import threading
-import psycopg2
-import asyncio # <-- Nayi line add ki hai
-from urllib.parse import urlparse
+import asyncio # Yeh import zaroori hai
 from flask import Flask
 
 from telegram import Update
@@ -21,56 +19,28 @@ def index():
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Database Setup ---
-DATABASE_URL = os.environ.get('DATABASE_URL')
+# Hum local file ka use karenge, jo Render par temporary hogi
+STATE_FILE = 'bot_state.json'
+logger.info(f"State file path: {STATE_FILE}")
 
-def get_db_connection():
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        return conn
-    except Exception as e:
-        logger.error(f"Could not connect to the database: {e}")
-        return None
 
-def setup_database():
-    conn = get_db_connection()
-    if conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS bot_state (
-                    key TEXT PRIMARY KEY,
-                    value JSONB NOT NULL
-                );
-            """)
-            conn.commit()
-        conn.close()
-        logger.info("Database table checked/created successfully.")
-
-# --- New State Management Functions (Using Database) ---
+# --- File-based State Management (Original) ---
 def load_state():
-    conn = get_db_connection()
-    if conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT value FROM bot_state WHERE key = 'main_state';")
-            result = cur.fetchone()
-        conn.close()
-        if result:
-            return result[0]
-    
-    logger.warning("No state found in DB. Returning default state.")
-    return {"is_running": False, "delay_seconds": 30}
+    """Loads the state from the JSON file."""
+    try:
+        with open(STATE_FILE, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logger.warning("State file not found. Creating a default state.")
+        return {"is_running": False, "delay_seconds": 30}
 
 def save_state(state):
-    conn = get_db_connection()
-    if conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO bot_state (key, value)
-                VALUES ('main_state', %s)
-                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
-            """, (json.dumps(state),))
-            conn.commit()
-        conn.close()
+    """Saves the current state to the JSON file."""
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f, indent=4)
+    except Exception as e:
+        logger.error(f"Failed to save state file: {e}")
 
 # --- Admin Check, Command Handlers, Message Handlers (SAME AS BEFORE) ---
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -148,13 +118,10 @@ async def repost_and_delete(context: ContextTypes.DEFAULT_TYPE):
 
 # --- Main Bot Function to run in a thread ---
 def run_bot():
-    # =========================================================================
-    # CRITICAL FIX FOR THREADING ISSUE: Create a new event loop for this thread
-    # =========================================================================
+    # Fix for threading issue
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    # =========================================================================
-
+    
     TOKEN = os.environ.get("TOKEN")
     if not TOKEN:
         logger.critical("CRITICAL ERROR: Bot Token not found!")
@@ -162,23 +129,18 @@ def run_bot():
         
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
+    # ... (baaki saare handlers)
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("setdelay", setdelay_command))
     application.add_handler(CommandHandler("startscrub", startscrub_command))
     application.add_handler(CommandHandler("stopscrub", stopscrub_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
-    
+
     logger.info("Starting bot polling...")
     application.run_polling()
-    logger.info("Bot polling has stopped.")
 
 # --- Main Execution Block ---
-if DATABASE_URL:
-    setup_database()
-else:
-    logger.warning("DATABASE_URL not found. Bot will not be able to save state.")
-
 bot_thread = threading.Thread(target=run_bot)
 bot_thread.daemon = True
 bot_thread.start()
