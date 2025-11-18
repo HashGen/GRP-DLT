@@ -2,7 +2,7 @@ import logging
 import json
 import os
 import threading
-import asyncio # Yeh import zaroori hai
+import asyncio
 from flask import Flask
 
 from telegram import Update
@@ -19,14 +19,12 @@ def index():
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Hum local file ka use karenge, jo Render par temporary hogi
 STATE_FILE = 'bot_state.json'
 logger.info(f"State file path: {STATE_FILE}")
 
 
-# --- File-based State Management (Original) ---
+# --- File-based State Management ---
 def load_state():
-    """Loads the state from the JSON file."""
     try:
         with open(STATE_FILE, 'r') as f:
             return json.load(f)
@@ -35,7 +33,6 @@ def load_state():
         return {"is_running": False, "delay_seconds": 30}
 
 def save_state(state):
-    """Saves the current state to the JSON file."""
     try:
         with open(STATE_FILE, 'w') as f:
             json.dump(state, f, indent=4)
@@ -128,8 +125,9 @@ def run_bot():
         return
         
     application = Application.builder().token(TOKEN).build()
+    
+    # Add all handlers
     application.add_handler(CommandHandler("start", start_command))
-    # ... (baaki saare handlers)
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("setdelay", setdelay_command))
     application.add_handler(CommandHandler("startscrub", startscrub_command))
@@ -138,7 +136,14 @@ def run_bot():
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
     logger.info("Starting bot polling...")
-    application.run_polling()
+    
+    # =========================================================================
+    # FINAL CRITICAL FIX: Disable signal handling in the polling thread
+    # =========================================================================
+    application.run_polling(stop_signals=None)
+    # =========================================================================
+    
+    logger.info("Bot polling has stopped.")
 
 # --- Main Execution Block ---
 bot_thread = threading.Thread(target=run_bot)
