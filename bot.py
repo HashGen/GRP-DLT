@@ -39,7 +39,7 @@ def save_state(state):
     except Exception as e:
         logger.error(f"Failed to save state file: {e}")
 
-# --- Admin Check, Command Handlers, Message Handlers (SAME AS BEFORE) ---
+# --- Admin Check, Command Handlers, Message Handlers ---
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if update.message.chat.type == 'private': return True
     chat_id = update.message.chat.id
@@ -101,17 +101,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not state.get('is_running', False): return
     if update.message and update.message.from_user.id == context.bot.id: return
     
-    # =========================================================================
-    # FINAL CRITICAL FIX #2: Access job_queue this way
-    # =========================================================================
-    job_queue = context.application.job_queue
-    job_queue.run_once(
+    # Access job_queue this way
+    context.application.job_queue.run_once(
         repost_and_delete,
         state.get('delay_seconds', 30),
         data={'chat_id': update.message.chat_id, 'message_id': update.message.message_id},
         name=str(update.message.message_id)
     )
-    # =========================================================================
 
 async def repost_and_delete(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
@@ -135,6 +131,7 @@ def run_bot():
     # Let the builder create its own JobQueue
     application = Application.builder().token(TOKEN).build()
 
+    # Add handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("setdelay", setdelay_command))
