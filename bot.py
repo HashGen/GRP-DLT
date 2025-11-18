@@ -2,6 +2,9 @@ import logging
 import json
 import os
 import threading
+import psycopg2
+import asyncio # <-- Nayi line add ki hai
+from urllib.parse import urlparse
 from flask import Flask
 
 from telegram import Update
@@ -9,46 +12,67 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.error import BadRequest
 
 # --- Flask App Setup ---
-# This will keep the web service alive
 app = Flask(__name__)
-
 @app.route('/')
 def index():
     return "Bot is running and live!"
 
 # --- Basic Bot Setup ---
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-DATA_DIR = '/data'
-if os.path.exists(DATA_DIR):
-    STATE_FILE = os.path.join(DATA_DIR, 'bot_state.json')
-else:
-    STATE_FILE = 'bot_state.json'
-    
-logger.info(f"State file path: {STATE_FILE}")
+# --- Database Setup ---
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
-
-# --- State Management Functions (For the bot's memory) ---
-def load_state():
+def get_db_connection():
     try:
-        with open(STATE_FILE, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        logger.warning("State file not found. Creating a default state.")
-        return {"is_running": False, "delay_seconds": 30}
+        conn = psycopg2.connect(DATABASE_URL)
+        return conn
+    except Exception as e:
+        logger.error(f"Could not connect to the database: {e}")
+        return None
+
+def setup_database():
+    conn = get_db_connection()
+    if conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    key TEXT PRIMARY KEY,
+                    value JSONB NOT NULL
+                );
+            """)
+            conn.commit()
+        conn.close()
+        logger.info("Database table checked/created successfully.")
+
+# --- New State Management Functions (Using Database) ---
+def load_state():
+    conn = get_db_connection()
+    if conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM bot_state WHERE key = 'main_state';")
+            result = cur.fetchone()
+        conn.close()
+        if result:
+            return result[0]
+    
+    logger.warning("No state found in DB. Returning default state.")
+    return {"is_running": False, "delay_seconds": 30}
 
 def save_state(state):
-    try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump(state, f, indent=4)
-    except Exception as e:
-        logger.error(f"Failed to save state file: {e}")
+    conn = get_db_connection()
+    if conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO bot_state (key, value)
+                VALUES ('main_state', %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+            """, (json.dumps(state),))
+            conn.commit()
+        conn.close()
 
-# --- Admin Check Function ---
+# --- Admin Check, Command Handlers, Message Handlers (SAME AS BEFORE) ---
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if update.message.chat.type == 'private': return True
     chat_id = update.message.chat.id
@@ -58,20 +82,16 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         context.chat_data['admins'] = [admin.user.id for admin in admins]
     return user_id in context.chat_data.get('admins', [])
 
-# --- Command Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
         await update.message.reply_text("⛔ Sorry, this command can only be used by admins.")
         return
-    help_text = (
-        "Hello! I am a Content Scrubber Bot.\n\n"
-        "I delete every message and repost it on my behalf after a set delay.\n\n"
-        "**Admin Commands:**\n"
-        "`/setdelay <seconds>` - Set the repost delay. (e.g., `/setdelay 15`)\n"
-        "`/startscrub` - Start the scrubbing process.\n"
-        "`/stopscrub` - Stop the process.\n"
-        "`/status` - Check the bot's current status."
-    )
+    help_text = "Hello! I am a Content Scrubber Bot.\n\n" \
+                "**Admin Commands:**\n" \
+                "`/setdelay <seconds>`\n" \
+                "`/startscrub`\n" \
+                "`/stopscrub`\n" \
+                "`/status`"
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
 async def setdelay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -109,7 +129,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     delay_text = state.get('delay_seconds', 'N/A')
     await update.message.reply_text(f"**📊 Bot Status**\n\n🔹 **Process:** {status_text}\n🔹 **Delay:** **{delay_text} seconds**", parse_mode='Markdown')
 
-# --- Message Handler ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     if not state.get('is_running', False): return
@@ -126,20 +145,22 @@ async def repost_and_delete(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
     except BadRequest as e:
         logger.warning(f"Could not process message {message_id}: {e}")
-    except Exception as e:
-        logger.error(f"Unexpected error for message {message_id}: {e}")
 
 # --- Main Bot Function to run in a thread ---
 def run_bot():
-    """Initializes and runs the bot."""
+    # =========================================================================
+    # CRITICAL FIX FOR THREADING ISSUE: Create a new event loop for this thread
+    # =========================================================================
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    # =========================================================================
+
     TOKEN = os.environ.get("TOKEN")
     if not TOKEN:
-        logger.critical("CRITICAL ERROR: Bot Token not found in environment!")
+        logger.critical("CRITICAL ERROR: Bot Token not found!")
         return
-
+        
     application = Application.builder().token(TOKEN).build()
-    
-    # Add all handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("setdelay", setdelay_command))
@@ -152,17 +173,12 @@ def run_bot():
     application.run_polling()
     logger.info("Bot polling has stopped.")
 
-# =========================================================================
-# CRITICAL CHANGE HERE: START THE BOT THREAD WHEN THE MODULE IS LOADED
-# =========================================================================
+# --- Main Execution Block ---
+if DATABASE_URL:
+    setup_database()
+else:
+    logger.warning("DATABASE_URL not found. Bot will not be able to save state.")
 
-logger.info("Setting up bot thread...")
 bot_thread = threading.Thread(target=run_bot)
-bot_thread.daemon = True # This ensures the thread will exit when the main process exits
+bot_thread.daemon = True
 bot_thread.start()
-
-# The 'if __name__ == "__main__":' block is now only for running locally
-if __name__ == "__main__":
-    logger.info("Running Flask app for local testing...")
-    app.run(host='0.0.0.0', port=8080)
-# =========================================================================
