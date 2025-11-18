@@ -32,7 +32,7 @@ def save_state(state):
     except Exception as e:
         logger.error(f"Failed to save state file: {e}")
 
-# --- Admin Check, Command Handlers, Message Handlers ---
+# --- Admin Check, Command Handlers ---
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not update.message or update.message.chat.type == 'private': return True
     chat_id = update.message.chat.id
@@ -87,26 +87,30 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     delay_text = state.get('delay_seconds', 'N/A')
     await update.message.reply_text(f"**📊 Bot Status**\n\n🔹 **Process:** {status_text}\n🔹 **Delay:** **{delay_text} seconds**", parse_mode='Markdown')
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = load_state()
-    if not state.get('is_running', False): return
-    if update.message and update.message.from_user.id == context.bot.id: return
-    
-    context.application.job_queue.run_once(
-        repost_and_delete,
-        state.get('delay_seconds', 30),
-        data={'chat_id': update.message.chat_id, 'message_id': update.message.message_id},
-        name=str(update.message.message_id)
-    )
-
-async def repost_and_delete(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    chat_id, message_id = job.data['chat_id'], job.data['message_id']
+# --- New Message Processing Logic ---
+async def process_message_after_delay(context: ContextTypes.DEFAULT_TYPE, delay: int, chat_id: int, message_id: int):
+    """Waits for a delay, then reposts and deletes the message."""
+    await asyncio.sleep(delay)
     try:
         await context.bot.copy_message(chat_id=chat_id, from_chat_id=chat_id, message_id=message_id)
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
     except BadRequest as e:
         logger.warning(f"Could not process message {message_id}: {e}")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
+    if not state.get('is_running', False): return
+    if not update.message or update.message.from_user.id == context.bot.id: return
+    
+    # Create a new task to handle the message in the background
+    asyncio.create_task(
+        process_message_after_delay(
+            context,
+            state.get('delay_seconds', 30),
+            update.message.chat_id,
+            update.message.message_id
+        )
+    )
 
 # --- Web Server to keep Render alive ---
 async def web_server():
@@ -129,6 +133,7 @@ async def main():
         logger.critical("CRITICAL ERROR: Bot Token not found!")
         return
 
+    # IMPORTANT: We are not using the builder's job_queue
     application = Application.builder().token(TOKEN).build()
 
     # Add handlers
@@ -146,13 +151,9 @@ async def main():
         await application.start()
         await application.updater.start_polling()
         
-        # Start the web server
         web_task = asyncio.create_task(web_server())
-        
-        # Keep everything running
         await web_task
         
-        # Stop the bot when the web server stops (won't happen in this case)
         await application.updater.stop()
         await application.stop()
 
