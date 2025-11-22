@@ -59,9 +59,18 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         context.chat_data['admins'] = [admin.user.id for admin in admins]
     return user_id in context.chat_data.get('admins', [])
 
+# --- UPDATED START COMMAND (Simple Welcome) ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context): return
-    help_text = "Hello! This is the bulletproof Scrubber Bot.\n\n" \
+    welcome_text = "👋 **Welcome to the Scrubber Bot!**\n\n" \
+                   "I am active and ready to manage your files.\n" \
+                   "Use `/help` to see instructions and commands."
+    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+
+# --- NEW HELP COMMAND (Detailed Instructions) ---
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context): return
+    help_text = "ℹ️ **Scrubber Bot Help**\n\n" \
                 "**How it works:**\n" \
                 "1. Set a loop duration ONCE with `/setloopduration`.\n" \
                 "2. Any file a HUMAN sends will loop for that duration.\n" \
@@ -188,8 +197,10 @@ async def main():
     if not TOKEN: logger.critical("CRITICAL ERROR: Bot Token not found!"); return
     application = Application.builder().token(TOKEN).build()
     
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", start_command))
+    # --- Updated Handlers ---
+    application.add_handler(CommandHandler("start", start_command)) # Calls new start_command
+    application.add_handler(CommandHandler("help", help_command))   # Calls new help_command
+    
     application.add_handler(CommandHandler("setloopduration", setloopduration_command))
     application.add_handler(CommandHandler("setdelay", setdelay_command))
     application.add_handler(CommandHandler("stopallloops", stopallloops_command))
