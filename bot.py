@@ -90,7 +90,7 @@ async def setdelay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context): return
     try:
         delay = int(context.args[0])
-        if not 5 <= delay <= 300: await update.message.reply_text("❗Delay must be between 5 and 300 seconds."); return
+        if delay < 5: await update.message.reply_text("❗Delay must be at least 5 seconds."); return
         config = get_config(); config['repost_delay_seconds'] = delay; save_config(config)
         await update.message.reply_text(f"✅ Repost delay set to **{delay} seconds**.", parse_mode='Markdown')
     except (IndexError, ValueError): await update.message.reply_text("Incorrect format! Use: `/setdelay 30`")
